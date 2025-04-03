@@ -1,0 +1,110 @@
+pipeline {
+    agent any
+    environment {
+        VAULT_ADDR = credentials('VAULT_ADDR')
+        VAULT_TOKEN = credentials('VAULT_TOKEN')
+        PATH = "/opt/sonar-scanner/bin:$PATH"
+        TERRAFORM_DIR = "terraform/"
+        
+    }
+    stages {
+        
+        stage('Test Vault') {
+            steps {
+                sh '''
+                echo "Testing Vault Connection..."
+                export VAULT_ADDR="${VAULT_ADDR}"
+                export VAULT_TOKEN="${VAULT_TOKEN}"
+
+                vault read -format=json aws/creds/dev-role > aws_creds.json || { echo "Vault read failed"; exit 1; }
+                jq -r '.data.access_key' aws_creds.json > access_key.txt
+                jq -r '.data.secret_key' aws_creds.json > secret_key.txt
+                '''
+            }
+        }
+
+        stage('Run Node.js Tests') {
+            steps {
+                dir('src') {
+                    sh '''
+                    echo "Running Node.js tests..."
+                    npm install || { echo "npm install failed"; exit 1; }
+                    '''
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    withSonarQubeEnv('SonarQube') {
+                        sh '''
+                        echo "Running SonarQube Analysis..."
+                        sonar-scanner \
+                            -Dsonar.projectKey=Project \
+                            -Dsonar.sources=src \
+                            -Dsonar.host.url=http://13.201.137.168:9000/ \
+                            -Dsonar.login=sqa_6c22027d63c27dc6b4aa343136c1e112465616a8 | tee sonar-report.txt
+                           '''
+                    }      
+
+                }
+            }
+        }
+
+        stage('TFScan') {
+            steps {
+                dir('terraform') {
+                    sh '''
+                    echo "Running TFScan..."
+                    tfsec . > tfsec-results.json || { echo "TFSec scan failed"; exit 1; }
+                    '''
+                }
+                archiveArtifacts artifacts: 'terraform/tfscan-report.txt', allowEmptyArchive: true
+            }
+        }
+
+        stage('Terraform init & Plan') {
+            steps {
+                dir('terraform') {
+                    sh '''
+                    echo "Initializing Terraform..."
+                    terraform init || { echo "Terraform init failed"; exit 1; }
+
+                    echo "Planning Terraform changes..."
+                    terraform plan -out=tfplan -var="aws_access_key=$(cat ../access_key.txt)" -var="aws_secret_key=$(cat ../secret_key.txt)"
+                    '''
+                }
+            }
+        }
+    stage('Terraform Apply') {
+        steps {
+            dir('terraform') {
+                    withCredentials([sshUserPrivateKey(credentialsId: 'ANSIBLE_SSH_KEY', keyFileVariable: 'SSH_KEY_PATH')]) {
+                    sh '''
+
+                    echo "Applying Terraform changes..."
+                    terraform apply -auto-approve tfplan
+
+                    echo "Fetching Public IP from Terraform output..."
+                    PUBLIC_IP=$(terraform output -json public_ips | jq -r '.[0]')
+                    if [ -z "$PUBLIC_IP" ]; then
+                        echo "Error: Terraform did not return a public IP!"
+                        exit 1
+                    fi
+                    echo "Public IP: ${PUBLIC_IP}"
+
+                    echo "Storing Public IP in Ansible inventory..."
+                    mkdir -p ../ansible
+                    echo "[webserver]" > ../ansible/inventory.ini
+                    echo "${PUBLIC_IP} ansible_user=ec2-user ansible_ssh_private_key_file=$WORKSPACE/ansible/ansible_ssh_key.pem" >> ../ansible/inventory.ini
+
+                    echo "Verifying inventory file..."
+                    cat ../ansible/inventory.ini
+                    '''
+                }    
+            }
+        }
+    
+    }
+}
